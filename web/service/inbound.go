@@ -559,6 +559,7 @@ func (s *InboundService) UpdateInbound(inbound *model.Inbound) (*model.Inbound, 
 	oldInbound.Enable = inbound.Enable
 	oldInbound.ExpiryTime = inbound.ExpiryTime
 	oldInbound.TrafficReset = inbound.TrafficReset
+	oldInbound.TrafficCoefficient = inbound.TrafficCoefficient
 	oldInbound.Listen = inbound.Listen
 	oldInbound.Port = inbound.Port
 	oldInbound.Protocol = inbound.Protocol
@@ -1368,19 +1369,52 @@ func (s *InboundService) addInboundTraffic(tx *gorm.DB, traffics []*xray.Traffic
 		return nil
 	}
 
-	var err error
+	tags := make([]string, 0, len(traffics))
+	for _, traffic := range traffics {
+		if traffic != nil && traffic.IsInbound {
+			tags = append(tags, traffic.Tag)
+		}
+	}
+
+	coeffByTag := make(map[string]float64, len(tags))
+	if len(tags) > 0 {
+		var inbounds []model.Inbound
+		if err := tx.Model(&model.Inbound{}).
+			Select("tag", "traffic_coefficient").
+			Where("tag IN ?", tags).
+			Find(&inbounds).Error; err != nil {
+			return err
+		}
+		for i := range inbounds {
+			coeff := inbounds[i].TrafficCoefficient
+			if coeff <= 0 {
+				coeff = 1
+			}
+			coeffByTag[inbounds[i].Tag] = coeff
+		}
+	}
 
 	for _, traffic := range traffics {
-		if traffic.IsInbound {
-			err = tx.Model(&model.Inbound{}).Where("tag = ?", traffic.Tag).
-				Updates(map[string]any{
-					"up":       gorm.Expr("up + ?", traffic.Up),
-					"down":     gorm.Expr("down + ?", traffic.Down),
-					"all_time": gorm.Expr("COALESCE(all_time, 0) + ?", traffic.Up+traffic.Down),
-				}).Error
-			if err != nil {
-				return err
-			}
+		if traffic == nil || !traffic.IsInbound {
+			continue
+		}
+
+		coeff := coeffByTag[traffic.Tag]
+		if coeff <= 0 {
+			coeff = 1
+		}
+
+		countedUp := int64(float64(traffic.Up) * coeff)
+		countedDown := int64(float64(traffic.Down) * coeff)
+
+		err := tx.Model(&model.Inbound{}).Where("tag = ?", traffic.Tag).
+			Updates(map[string]any{
+				"up":       gorm.Expr("up + ?", countedUp),
+				"down":     gorm.Expr("down + ?", countedDown),
+				"all_time": gorm.Expr("COALESCE(all_time, 0) + ?", countedUp+countedDown),
+			}).Error
+		if err != nil {
+			return err
 		}
 	}
 	return nil
@@ -1426,15 +1460,47 @@ func (s *InboundService) addClientTraffic(tx *gorm.DB, traffics []*xray.ClientTr
 			trafficByEmail[traffics[i].Email] = traffics[i]
 		}
 	}
+	inboundIDs := make([]int, 0, len(dbClientTraffics))
+	for i := range dbClientTraffics {
+		inboundIDs = append(inboundIDs, dbClientTraffics[i].InboundId)
+	}
+
+	coeffByInboundID := make(map[int]float64, len(inboundIDs))
+	if len(inboundIDs) > 0 {
+		var inbounds []model.Inbound
+		if err := tx.Model(&model.Inbound{}).
+			Select("id", "traffic_coefficient").
+			Where("id IN ?", inboundIDs).
+			Find(&inbounds).Error; err != nil {
+			return err
+		}
+		for i := range inbounds {
+			coeff := inbounds[i].TrafficCoefficient
+			if coeff <= 0 {
+				coeff = 1
+			}
+			coeffByInboundID[inbounds[i].Id] = coeff
+		}
+	}
+
 	now := time.Now().UnixMilli()
 	for dbTraffic_index := range dbClientTraffics {
 		t, ok := trafficByEmail[dbClientTraffics[dbTraffic_index].Email]
 		if !ok {
 			continue
 		}
-		dbClientTraffics[dbTraffic_index].Up += t.Up
-		dbClientTraffics[dbTraffic_index].Down += t.Down
-		dbClientTraffics[dbTraffic_index].AllTime += t.Up + t.Down
+
+		coeff := coeffByInboundID[dbClientTraffics[dbTraffic_index].InboundId]
+		if coeff <= 0 {
+			coeff = 1
+		}
+
+		countedUp := int64(float64(t.Up) * coeff)
+		countedDown := int64(float64(t.Down) * coeff)
+
+		dbClientTraffics[dbTraffic_index].Up += countedUp
+		dbClientTraffics[dbTraffic_index].Down += countedDown
+		dbClientTraffics[dbTraffic_index].AllTime += countedUp + countedDown
 		if t.Up+t.Down > 0 {
 			onlineClients = append(onlineClients, t.Email)
 			dbClientTraffics[dbTraffic_index].LastOnline = now
